@@ -1,6 +1,6 @@
 import sqlite3
 
-conn = sqlite3.connect("knowledge_base.db")
+conn = sqlite3.connect("knowledge_base_helper.db")
 cur = conn.cursor()
 
 cur.execute("SELECT COUNT(*) FROM discourse_chunks")
