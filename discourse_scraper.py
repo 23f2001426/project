@@ -1,84 +1,62 @@
-import os
+# generate_embeddings.py
+import sqlite3
 import json
-import requests
+import os
+import asyncio
+import aiohttp
 from dotenv import load_dotenv
-from tqdm import tqdm
 
-# Load .env
 load_dotenv()
+API_KEY = os.getenv("API_KEY")
+DB_PATH = "knowledge_base.db"
+BATCH_SIZE = 100  # Tune if rate-limited
 
-DISCOURSE_URL = "https://discourse.onlinedegree.iitm.ac.in"
-CATEGORY_SLUG = "courses/tds-kb"
-CATEGORY_ID = 34
-OUTPUT_DIR = "downloaded_threads"
+async def get_embedding(openai_input):
+    url = "https://aipipe.org/openai/v1/embeddings"
+    headers = {
+        "Authorization": API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "text-embedding-3-small",
+        "input": openai_input
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["data"][0]["embedding"]
 
-# Create output directory
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+async def process_batch(chunks):
+    async with aiohttp.ClientSession() as session:
+        for chunk_id, content in chunks:
+            embedding = await get_embedding(content)
+            yield chunk_id, embedding
 
-# Load cookies from .env
-cookies = {
-    '_t': os.getenv("DISCOURSE_T_COOKIE", ""),
-    '_forum_session': os.getenv("DISCOURSE_SESSION_COOKIE", "")
-}
-
-def create_authenticated_session(base_url, cookies):
-    session = requests.Session()
-    domain = base_url.split('//')[1]
-    for name, value in cookies.items():
-        session.cookies.set(name, value, domain=domain)
-    return session
-
-def fetch_all_topic_ids(session, category_id):
-    topic_ids = []
-    page = 0
-
-    while True:
-        url = f"{DISCOURSE_URL}/c/{CATEGORY_SLUG}/{category_id}.json?page={page}"
-        response = session.get(url)
-        if response.status_code != 200:
-            break
-        data = response.json()
-        topics = data.get("topic_list", {}).get("topics", [])
-        if not topics:
-            break
-        topic_ids.extend([t["id"] for t in topics])
-        page += 1
-
-    return list(set(topic_ids))
-
-def download_topic(session, topic_id, output_dir):
-    url = f"{DISCOURSE_URL}/t/{topic_id}.json"
-    response = session.get(url)
-    if response.status_code == 200:
-        topic_data = response.json()
-        file_path = os.path.join(output_dir, f"{topic_id}.json")
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(topic_data, f, indent=2)
-        return True
-    return False
-
-def main():
-    session = create_authenticated_session(DISCOURSE_URL, cookies)
-
-    # Test authentication
-    test = session.get(f"{DISCOURSE_URL}/session/current.json")
-    if test.status_code != 200:
-        print("Authentication failed.")
+async def main():
+    if not API_KEY:
+        print("Error: API_KEY missing")
         return
-    user = test.json().get("current_user", {}).get("username")
-    print(f"Authenticated as: {user}")
 
-    # Fetch all topic IDs from the category
-    print(f"Fetching topic IDs from category ID {CATEGORY_ID}...")
-    topic_ids = fetch_all_topic_ids(session, CATEGORY_ID)
-    print(f"Found {len(topic_ids)} topics.")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, content FROM discourse_chunks WHERE embedding IS NULL")
+    all_rows = cur.fetchall()
+    print(f"Found {len(all_rows)} chunks without embeddings")
 
-    # Download each topic JSON
-    print("Downloading topics...")
-    for tid in tqdm(topic_ids, desc="Topics"):
-        download_topic(session, tid, OUTPUT_DIR)
+    for i in range(0, len(all_rows), BATCH_SIZE):
+        batch = all_rows[i:i + BATCH_SIZE]
+        print(f"Processing batch {i//BATCH_SIZE + 1} ({len(batch)} chunks)")
+        async for chunk_id, embedding in process_batch(batch):
+            cur.execute(
+                "UPDATE discourse_chunks SET embedding = ? WHERE id = ?",
+                (json.dumps(embedding), chunk_id)
+            )
+        conn.commit()
 
-    print("Download complete. JSON files saved to:", OUTPUT_DIR)
+    conn.close()
+    print(" Done generating embeddings")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
